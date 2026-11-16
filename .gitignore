@@ -1,0 +1,42 @@
+# Python caches and local environments
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.venv/
+venv/
+
+# Generated experiment outputs and caches
+runs/
+wandb/
+checkpoints/
+.cache/
+/ga/cache/
+*.log
+
+# Local datasets and model weights
+/data/
+/models/
+/DiRL/public/
+*.safetensors
+*.pt
+*.pth
+*.ckpt
+pytorch_model*.bin
+
+# Local credentials
+.env
+.env.*
+!.env.example
+!.env.sample
+*.pem
+*.key
+
+# Editor and operating-system temporary files
+.DS_Store
+*.swp
+*.swo
+*~

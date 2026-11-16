@@ -1,0 +1,44 @@
+{
+  "created_at": "2026-11-09T20:13:55.816363+08:00",
+  "source_root": "/mnt/shared-storage-user/dllm-share/liuyang",
+  "source_components": [
+    "sdar_justgmpo",
+    "DiRL/lmdeploy",
+    "DiRL/LICENSE",
+    "GMPO/train_zero_math_gmpo.py",
+    "GMPO/readme.md"
+  ],
+  "code_only": true,
+  "includes_models": false,
+  "includes_datasets": false,
+  "includes_environment": false,
+  "includes_training_runs": false,
+  "excluded_directories": [
+    ".git",
+    ".pytest_cache",
+    ".ruff_cache",
+    "__pycache__",
+    "lmdeploy.egg-info",
+    "runs",
+    "verification",
+    "eval_*"
+  ],
+  "source_environment": {
+    "python": "3.12.14",
+    "torch": "2.8.0+cu128",
+    "flash_attn": "2.8.3",
+    "torch_cxx11_abi": true,
+    "flash_attn_import_succeeded": true,
+    "gpu_available_at_packaging": false
+  },
+  "training_sources_modified": false,
+  "addition": "run_train_portable.sh resolves torchrun from the active environment; original source files are unchanged",
+  "validation": {
+    "cpu_tests_passed": 25,
+    "cpu_tests_failed": 0,
+    "python_syntax_files": 457,
+    "shell_syntax": true,
+    "launcher_dry_run": true,
+    "gpu_test_performed": false
+  }
+}

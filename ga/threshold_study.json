@@ -1,0 +1,36 @@
+{
+  "seed": 20261112,
+  "gpus": [0, 1, 2, 3, 4, 5, 6, 7],
+  "max_new_tokens": 8192,
+  "batch_size": 1,
+  "cache_fraction": 0.15,
+  "budget_views": [512, 1024],
+  "E0": [
+    {"name": "F075", "kind": "fixed", "threshold": 0.75},
+    {"name": "F080", "kind": "fixed", "threshold": 0.80},
+    {"name": "F085", "kind": "fixed", "threshold": 0.85},
+    {"name": "F090", "kind": "fixed", "threshold": 0.90},
+    {"name": "F095", "kind": "fixed", "threshold": 0.95},
+    {"name": "F098", "kind": "fixed", "threshold": 0.98}
+  ],
+  "E1": [
+    {"name": "StepDown", "kind": "step", "start": 0.95, "end": 0.80, "span": 8},
+    {"name": "StepUp", "kind": "step", "start": 0.80, "end": 0.95, "span": 8},
+    {"name": "OSDTBlock", "kind": "osdt", "mode": "block", "cap": 0.98, "slack": 0.05, "lower": 0.75, "upper": 0.98, "fallback": 0.90},
+    {"name": "OSDTStep", "kind": "osdt", "mode": "step_block", "cap": 0.98, "slack": 0.05, "lower": 0.75, "upper": 0.98, "fallback": 0.90},
+    {"name": "CadProgress", "kind": "cad", "start": 0.95, "end": 0.80}
+  ],
+  "E2": [
+    {"name": "Factor025", "kind": "factor", "factor": 0.25},
+    {"name": "Factor050", "kind": "factor", "factor": 0.50},
+    {"name": "Factor100", "kind": "factor", "factor": 1.00},
+    {"name": "Factor200", "kind": "factor", "factor": 2.00}
+  ],
+  "support": [
+    {"name": "F033", "kind": "fixed", "threshold": 0.33},
+    {"name": "F050", "kind": "fixed", "threshold": 0.50},
+    {"name": "F067", "kind": "fixed", "threshold": 0.67}
+  ],
+  "timing_questions": 10,
+  "timing_repeats": 3
+}

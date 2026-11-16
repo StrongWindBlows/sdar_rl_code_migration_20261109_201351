@@ -1,0 +1,15 @@
+{
+  "seed": 20261112,
+  "model": "/ssd_data/liuyang/hug/model/SDAR-4B-Chat-b32",
+  "gpus": [4, 5, 6, 7],
+  "forward_cap": 512,
+  "max_new_tokens": 8192,
+  "temperatures": [1.0, 2.0],
+  "sampling_seeds": [20261112, 20261113, 20261114],
+  "search_steps": 8,
+  "pilot_ids": [
+    "test/intermediate_algebra/1126.json",
+    "test/prealgebra/1251.json",
+    "test/precalculus/1133.json"
+  ]
+}

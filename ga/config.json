@@ -1,0 +1,52 @@
+{
+  "model": "/ssd_data/liuyang/hug/model/SDAR-4B-Chat-b32",
+  "data": "/ssd_data/liuyang/hug/data/MATH-500/subsets/mechanism100_seed20261110",
+  "gpus": [
+    4,
+    5,
+    6,
+    7
+  ],
+  "block_length": 32,
+  "max_new_tokens": 4096,
+  "batch_size": 1,
+  "top_k_record": 5,
+  "seed": 20261110,
+  "scope": "pilot",
+  "trace": true,
+  "cache_fraction": 0.15,
+  "eager": false,
+  "settings": [
+    {
+      "name": "T32",
+      "steps": 32,
+      "strategy": "low_confidence_static"
+    },
+    {
+      "name": "T16",
+      "steps": 16,
+      "strategy": "low_confidence_static"
+    },
+    {
+      "name": "T8",
+      "steps": 8,
+      "strategy": "low_confidence_static"
+    },
+    {
+      "name": "T4",
+      "steps": 4,
+      "strategy": "low_confidence_static"
+    },
+    {
+      "name": "Dynamic",
+      "steps": 32,
+      "strategy": "low_confidence_dynamic",
+      "threshold": 0.9
+    }
+  ],
+  "source": "T8",
+  "continuation": "T8",
+  "positions": "confidence",
+  "grade_timeout": 1.0,
+  "check_tokens": 96
+}
