@@ -23,7 +23,7 @@ RUNTIME_KEYS = (
     'inference_prefix_caching', 'inference_max_prefill_tokens', 'train_tf32',
     'eval_data', 'eval_max_tokens', 'eval_batch_size', 'eval_seed',
     'eval_every', 'eval_at_start', 'inference_progress_timeout', 'inference_retries',
-    'entropy_probe_size', 'entropy_probe_tokens',
+    'entropy_probe_size', 'entropy_probe_tokens', 'train_phase_batch_size',
 )
 
 

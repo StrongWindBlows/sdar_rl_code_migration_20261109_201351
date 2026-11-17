@@ -51,6 +51,7 @@ INFERENCE_RETRIES="${INFERENCE_RETRIES:-1}"
 ENTROPY_PROBE_SIZE="${ENTROPY_PROBE_SIZE:-0}"
 ENTROPY_PROBE_TOKENS="${ENTROPY_PROBE_TOKENS:-128}"
 TRAIN_TF32="${TRAIN_TF32:-true}"
+TRAIN_PHASE_BATCH_SIZE="${TRAIN_PHASE_BATCH_SIZE:-1}"
 RUN_TAG="${RUN_TAG:-sdar4b-just${OBJECTIVE}-math-rbs${ROLLOUT_BATCH_SIZE}}"
 OUTPUT="${OUTPUT:-$SCRIPT_DIR/runs/$RUN_TAG}"
 RESUME="${RESUME:-}"
@@ -89,6 +90,7 @@ else
     if [[ -n "$BLOCK_SIZE" ]]; then COMMAND+=(--block-size "$BLOCK_SIZE"); fi
 fi
 COMMAND+=(--rollout-batch-size "$ROLLOUT_BATCH_SIZE"
+    --train-phase-batch-size "$TRAIN_PHASE_BATCH_SIZE"
     --inference-cache-fraction "$INFERENCE_CACHE_FRACTION"
     --inference-max-prefill-tokens "$INFERENCE_MAX_PREFILL_TOKENS"
     --inference-progress-timeout "$INFERENCE_PROGRESS_TIMEOUT" --inference-retries "$INFERENCE_RETRIES"

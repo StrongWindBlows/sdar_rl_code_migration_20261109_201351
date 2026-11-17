@@ -56,8 +56,9 @@ class CheckpointEvaluationTests(unittest.TestCase):
             inference_cache_fraction=0.25,inference_cuda_graph=False,
             inference_prefix_caching=True,inference_max_prefill_tokens=8192,
             inference_retries=0, inference_progress_timeout=600)
-        self.parallel = SimpleNamespace(rank=0, world=4, control_group=object(),
-                                        gpu_group=lambda: '4,5')
+        self.parallel = SimpleNamespace(rank=0, world=2, tp_rank=0, dp_rank=0, dp_size=1,
+                                        control_group=object(), gpu_group=lambda: '4,5',
+                                        failures=lambda error: [error] if error else [])
         self.metrics = dict(accuracy=0.5, correct=1, total=2, mean_tokens=32,
                             truncated_rate=0, grading_timeouts=0)
         for target in ('train.torch.cuda.empty_cache', 'train.dist.barrier',
@@ -121,6 +122,7 @@ class CheckpointEvaluationTests(unittest.TestCase):
 
     def test_other_ranks_receive_failure_without_starting_an_engine(self):
         self.parallel.rank = 1
+        self.parallel.tp_rank = 1
         def failure(value, **kwargs):
             value[0] = 'evaluation worker failed'
         self.broadcast_object_list.side_effect = failure
@@ -151,3 +153,32 @@ class CheckpointEvaluationTests(unittest.TestCase):
             evaluate_checkpoint(self.checkpoint, self.args, self.parallel, self.output)
         self.assertFalse((self.checkpoint/'eval').exists())
         self.assertTrue((self.output/'metrics.json').is_file())
+
+    def test_each_dp_leader_evaluates_its_shard_and_only_rank_zero_merges(self):
+        root_output = self.output
+        self.parallel.world, self.parallel.dp_size = 4, 2
+        for rank, dp_rank, gpus in [(2,1,'6,7'), (0,0,'4,5')]:
+            self.parallel.rank, self.parallel.dp_rank = rank, dp_rank
+            self.parallel.gpu_group = lambda: gpus
+            self.output = root_output/f'shard-{dp_rank}'
+            with patch('train.run_inference',side_effect=self.worker) as launch, \
+                 patch('train.merge_evaluations',return_value=self.metrics) as merge:
+                evaluate_checkpoint(self.checkpoint,self.args,self.parallel)
+                command = launch.call_args.args[0]
+                self.assertEqual(command[command.index('--num-shards')+1],'2')
+                self.assertEqual(command[command.index('--shard-index')+1],str(dp_rank))
+                self.assertEqual(command[command.index('--output')+1],str(self.output))
+                self.assertEqual(launch.call_args.kwargs['env']['CUDA_VISIBLE_DEVICES'],gpus)
+                if rank == 0:
+                    merge.assert_called_once_with(root_output,2)
+                else:
+                    merge.assert_not_called()
+
+    def test_shard_failure_is_reported_before_merge(self):
+        self.parallel.dp_size = 2
+        self.parallel.failures = lambda error: ['DP 1 evaluation failed']
+        with patch('train.run_inference',side_effect=RuntimeError('engine failed')), \
+             patch('train.merge_evaluations') as merge:
+            with self.assertRaisesRegex(RuntimeError,'DP 1 evaluation failed'):
+                evaluate_checkpoint(self.checkpoint,self.args,self.parallel)
+        merge.assert_not_called()

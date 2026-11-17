@@ -1,14 +1,18 @@
 import ast
+import copy
+import math
 from pathlib import Path
 from types import SimpleNamespace
 import unittest
+from unittest.mock import patch
 
 import torch
 import torch.nn.functional as F
 
 import algorithm
 import likelihood
-from algorithm import Response, policy_loss, cache_old_logps, backward_response, group_advantages
+from algorithm import (Response, policy_loss, cache_old_logps, backward_response,
+                       backward_on_policy_grpo, group_advantages)
 from likelihood import SDARPolicy, phase_inputs
 from vendor.sdar import modeling_sdar as sdar
 from vendor.sdar.configuration_sdar import SDARConfig
@@ -32,12 +36,12 @@ def official_loss(new, old, advantage, mask, epsilon=.4):
     return ns['pg_losses'].sum()
 
 
-def dense_packed(n, block_size, device):
-    idx = torch.arange(2*n,device=device)
+def dense_packed(n, block_size, device, phase_count=1):
+    idx = torch.arange((phase_count+1)*n,device=device)
     q,k = idx[:,None],idx[None,:]
-    qc,kc = q>=n,k>=n
+    qc,kc = q>=phase_count*n,k>=phase_count*n
     qb,kb = (q%n)//block_size,(k%n)//block_size
-    return ((~qc&~kc&(qb==kb)) | (~qc&kc&(kb<qb)) | (qc&kc&(kb<=qb)))[None]
+    return ((~qc&~kc&(q//n==k//n)&(qb==kb)) | (~qc&kc&(kb<qb)) | (qc&kc&(kb<=qb)))[None]
 
 
 class ObjectiveTests(unittest.TestCase):
@@ -119,17 +123,20 @@ class SDARGradientTests(unittest.TestCase):
         for p,t in [(b,2*b),(b+1,2*b-1),(b+2,b+1),(2*b-1,2),(3,1)]:
             response = Response([1]*p,[2]*t,1)
             expected = self.serial(response)
-            actual,_ = algorithm.response_logps(self.model,response)
-            torch.testing.assert_close(actual,expected)
-            seen = []
-            for ids,_,target,_ in phase_inputs(response,b,31,'cpu'):
-                self.assertTrue((ids[0,target]==31).all())
-                seen.extend(target.tolist())
-            self.assertEqual(sorted(seen),list(range(p,p+t)))
+            for phase_batch_size in (1,2,4):
+                actual,_ = algorithm.response_logps(self.model,response,phase_batch_size=phase_batch_size)
+                torch.testing.assert_close(actual,expected)
+                seen = []
+                for ids,positions,target,labels,_ in phase_inputs(response,b,31,'cpu',phase_batch_size):
+                    self.assertTrue((ids[0,target]==31).all())
+                    torch.testing.assert_close(labels,torch.tensor(response.tokens)[positions[0,target]-p])
+                    seen.extend(positions[0,target].tolist())
+                self.assertEqual(sorted(seen),list(range(p,p+t)))
 
     def test_streamed_gmpo_and_grpo_match_serial_model_gradients(self):
-        responses = [Response([1,2,3,4,5],[6,7,2,9,10,11,12],1,True,1.3),
-                     Response([1,2,3,4,5,6],[7,8,2,10,11],0,True,-.7)]
+        b = self.block_size
+        responses = [Response([1]*(b+1),[6,7,2,9,10,11,12],1,True,1.3),
+                     Response([1]*(b+2),[7,8,2,10,11],0,True,-.7)]
         cache_old_logps(self.model,responses)
         # Trigger token clipping in both advantage directions.
         for response in responses:
@@ -140,30 +147,66 @@ class SDARGradientTests(unittest.TestCase):
                 torch.ones(len(r.tokens),dtype=torch.bool),objective=objective)/len(responses) for r in responses)
             reference.backward()
             expected = self.flat_gradient().clone()
+            for phase_batch_size in (1,2,4):
+                self.model.zero_grad()
+                actual = sum(backward_response(self.model,r,len(responses),objective=objective,
+                    phase_batch_size=phase_batch_size)['loss'] for r in responses)/len(responses)
+                delta = (self.flat_gradient()-expected).abs().max().item()
+                print({'objective':objective,'phase_batch_size':phase_batch_size,
+                       'serial_vs_streamed_gradient_max_error':delta},flush=True)
+                self.assertLess(delta,1e-6)
+                self.assertAlmostEqual(actual,reference.item(),places=6)
+
+    def test_single_pass_grpo_matches_two_pass_gradient_and_adam(self):
+        b = self.block_size
+        responses = [Response([1]*b,[6]*(b+3),1,True,1.3),
+                     Response([2]*(b+1),[7]*(b+2),0,True,-.7),
+                     Response([3],[8,9],0,True,0.)]
+        initial = copy.deepcopy(self.model.state_dict())
+        cache_old_logps(self.model,responses)
+        expected_stats = [backward_response(self.model,r,len(responses),objective='grpo') for r in responses]
+        expected_grad = self.flat_gradient().clone()
+        torch.optim.AdamW(self.model.parameters(),lr=.001,weight_decay=0.,foreach=False).step()
+        expected_weights = copy.deepcopy(self.model.state_dict())
+        for response in responses:
+            response.old_logps = None
+        for phase_batch_size in (1,2,4):
+            self.model.load_state_dict(initial)
             self.model.zero_grad()
-            actual = sum(backward_response(self.model,r,len(responses),objective=objective)['loss']
-                         for r in responses)/len(responses)
-            delta = (self.flat_gradient()-expected).abs().max().item()
-            print({'objective':objective,'serial_vs_streamed_gradient_max_error':delta},flush=True)
-            self.assertLess(delta,1e-6)
-            self.assertAlmostEqual(actual,reference.item(),places=6)
+            if phase_batch_size == 4:
+                self.model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={'use_reentrant':False})
+            with patch('algorithm.response_logps',side_effect=AssertionError('Unexpected no-grad pass')), \
+                 patch.object(self.model,'forward',wraps=self.model.forward) as forward:
+                actual_stats = [backward_on_policy_grpo(self.model,r,len(responses),
+                    phase_batch_size=phase_batch_size) for r in responses]
+            self.assertEqual(forward.call_count,math.ceil(b/phase_batch_size)+math.ceil((b-1)/phase_batch_size))
+            torch.testing.assert_close(self.flat_gradient(),expected_grad,atol=1e-7,rtol=2e-5)
+            for actual,expected in zip(actual_stats,expected_stats):
+                for key in expected:
+                    self.assertAlmostEqual(actual[key],expected[key],places=5)
+            torch.optim.AdamW(self.model.parameters(),lr=.001,weight_decay=0.,foreach=False).step()
+            for name,weight in self.model.state_dict().items():
+                torch.testing.assert_close(weight,expected_weights[name],atol=2e-6,rtol=2e-5)
 
     def test_old_logps_remain_frozen_across_optimizer_updates(self):
         responses = [Response([1,2,3,4,5],[6,7,8,9],1,True,1.0),
                      Response([1,2,3,4,5],[8,9,10,11],0,True,-1.0)]
-        cache_old_logps(self.model,responses)
-        frozen = [r.old_logps.clone() for r in responses]
-        optimizer = torch.optim.SGD(self.model.parameters(),lr=.01)
-        drift = []
-        for response in responses:
-            optimizer.zero_grad()
-            stats = backward_response(self.model,response,1)
-            drift.append(stats['log_ratio_abs_max'])
-            optimizer.step()
-        self.assertLess(drift[0],1e-6)
-        self.assertGreater(drift[1],1e-5)
-        for old,response in zip(frozen,responses):
-            torch.testing.assert_close(old,response.old_logps,rtol=0,atol=0)
+        initial = copy.deepcopy(self.model.state_dict())
+        for objective in ('gmpo','grpo'):
+            self.model.load_state_dict(initial)
+            cache_old_logps(self.model,responses,phase_batch_size=4)
+            frozen = [r.old_logps.clone() for r in responses]
+            optimizer = torch.optim.SGD(self.model.parameters(),lr=.01)
+            drift = []
+            for response in responses:
+                optimizer.zero_grad()
+                stats = backward_response(self.model,response,1,objective=objective,phase_batch_size=4)
+                drift.append(stats['log_ratio_abs_max'])
+                optimizer.step()
+                for old,record in zip(frozen,responses):
+                    torch.testing.assert_close(old,record.old_logps,rtol=0,atol=0)
+            self.assertLess(drift[0],1e-6)
+            self.assertGreater(drift[1],1e-5)
 
     def test_zero_advantage_still_counts_in_minibatch_denominator(self):
         response = Response([1,2,3,4],[5,6,7],1,True,1.0)

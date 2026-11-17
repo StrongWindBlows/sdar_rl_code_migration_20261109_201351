@@ -9,9 +9,10 @@ from torch.nn.attention.flex_attention import create_block_mask
 from vendor.sdar.modeling_sdar import SDARForCausalLM
 
 
-def phase_inputs(response, block_size: int, mask_id: int, device):
-    """Yield [noisy, clean], repeated positions, target positions and labels.
+def phase_inputs(response, block_size: int, mask_id: int, device, phase_batch_size=1):
+    """Yield packed phases, positions, targets, labels and number of noisy branches.
 
+    Each group packs [noisy_0, ..., noisy_k, clean], sharing the clean branch.
     Pad to 128 for Flex Attention tile shapes. Within the last real block these
     are MASK context; subsequent blocks are causally invisible to all targets.
     """
@@ -23,35 +24,42 @@ def phase_inputs(response, block_size: int, mask_id: int, device):
     valid = (index >= p) & (index < p+t)
     first = torch.maximum(index // block_size * block_size, index.new_tensor(p))
     phase_index = index - first
-    for phase in range(block_size):
-        target = valid & (phase_index == phase)
-        if not target.any():
+    for start in range(0, block_size, phase_batch_size):
+        noisy, targets, labels = [], [], []
+        for phase in range(start, min(start + phase_batch_size, block_size)):
+            target = torch.where(valid & (phase_index == phase))[0]
+            if not target.numel():
+                continue
+            targets.append(target + len(noisy) * n)
+            labels.append(clean[target])
+            noisy.append(clean.masked_fill(valid & (phase_index >= phase), mask_id))
+        if not noisy:
             continue
-        masked = valid & (phase_index >= phase)
-        noisy = clean.masked_fill(masked, mask_id)
-        yield (torch.cat([noisy, clean])[None], index.repeat(2)[None],
-               torch.where(target)[0], clean[target])
+        yield (torch.cat(noisy + [clean])[None], index.repeat(len(noisy) + 1)[None],
+               torch.cat(targets), torch.cat(labels), len(noisy))
 
 
 @lru_cache(maxsize=64)
-def packed_attention(n: int, block_size: int, device: str):
+def packed_attention(n: int, block_size: int, device: str, phase_count=1):
     def visible(b, h, q, k):
-        q_clean, k_clean = q >= n, k >= n
+        q_branch, k_branch = q // n, k // n
+        q_clean, k_clean = q_branch == phase_count, k_branch == phase_count
         qb, kb = (q % n) // block_size, (k % n) // block_size
-        noisy_self = (~q_clean) & (~k_clean) & (qb == kb)
+        noisy_self = (~q_clean) & (q_branch == k_branch) & (qb == kb)
         noisy_past = (~q_clean) & k_clean & (kb < qb)
         clean_past = q_clean & k_clean & (kb <= qb)
         return noisy_self | noisy_past | clean_past
-    return create_block_mask(visible, B=None, H=None, Q_LEN=2*n, KV_LEN=2*n, device=device)
+    length = (phase_count + 1) * n
+    return create_block_mask(visible, B=None, H=None, Q_LEN=length, KV_LEN=length, device=device)
 
 
 class SDARPolicy(SDARForCausalLM):
     """Same weights/backbone; explicit likelihood path instead of diffusion loss."""
 
     def forward(self, input_ids, position_ids, target_positions, labels,
-                active_vocab: int, temperature: float = 1.0):
-        n = input_ids.shape[1] // 2
-        mask = packed_attention(n, self.config.block_size, str(input_ids.device))
+                active_vocab: int, temperature: float = 1.0, phase_count=1):
+        n = input_ids.shape[1] // (phase_count + 1)
+        mask = packed_attention(n, self.config.block_size, str(input_ids.device), phase_count)
         # autocast does not cast embedding lookups. Keep residuals/RoPE in the
         # compute dtype while gradients flow back to the FP32 master embedding.
         embeds = self.model.embed_tokens(input_ids)

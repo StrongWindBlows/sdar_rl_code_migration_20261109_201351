@@ -1,4 +1,4 @@
-"""Sample -> freeze old log-probs -> shuffle -> several GMPO updates -> resample."""
+"""Sample -> GRPO/GMPO updates -> evaluate -> resample."""
 import os
 
 # Reuse the audit trainer's one-visible-device-per-worker LMDeploy setup.
@@ -22,8 +22,10 @@ import torch
 import torch.distributed as dist
 from transformers import AutoTokenizer, GenerationConfig
 
-from algorithm import Response, group_advantages, cache_old_logps, backward_response, response_logps
+from algorithm import (Response, group_advantages, cache_old_logps, backward_response,
+                       backward_on_policy_grpo, response_logps)
 from data import load_math
+from eval import merge_evaluations
 from likelihood import SDARPolicy
 from vendor.sdar.configuration_sdar import SDARConfig
 from inference_files import generation_config_path
@@ -60,6 +62,8 @@ def arguments():
                    help='Restart inference after this many seconds without new tokens')
     p.add_argument('--inference-retries', type=int, default=1)
     p.add_argument('--train-tf32', action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument('--train-phase-batch-size', type=int, default=1,
+                   help='Phases per learner forward, sharing one clean branch')
     p.add_argument('--block-size', type=int, choices=[1,2,4,8,16,32,64,128], default=None,
                    help='Shared learner/rollout block size; default: model config (legacy fallback 4)')
     p.add_argument('--tp-size',type=int,default=1,help='Learner and rollout tensor-parallel size')
@@ -108,59 +112,76 @@ def minibatches(responses, size, seed):
 
 
 def evaluate_checkpoint(path, args, parallel, evaluation_output=None):
-    """All ranks wait on CPU while rank 0 evaluates the saved BF16 export."""
+    """Each TP leader evaluates one shard; rank 0 publishes the combined results."""
     if not args.eval_data:
         return
     torch.cuda.empty_cache()
     if parallel.world > 1:
         dist.barrier(group=parallel.control_group)
-    error = [None]
-    if parallel.rank == 0:
-        output = Path(evaluation_output) if evaluation_output is not None else Path(path)/'eval'
+    output = Path(evaluation_output) if evaluation_output is not None else Path(path)/'eval'
+    try:
+        metrics = json.loads((output/'metrics.json').read_text())
+    except (FileNotFoundError, json.JSONDecodeError):
+        metrics = None
+    complete = metrics is not None
+    error = None
+    if metrics is None and parallel.tp_rank == 0:
+        shard = output/f'shard-{parallel.dp_rank}' if parallel.dp_size > 1 else output
         try:
             try:
-                metrics = json.loads((output/'metrics.json').read_text())
+                metrics = json.loads((shard/'metrics.json').read_text())
             except (FileNotFoundError, json.JSONDecodeError):
-                output.mkdir(parents=True, exist_ok=True)
+                shard.mkdir(parents=True, exist_ok=True)
                 env = inference_env(parallel.gpu_group())
                 command = [sys.executable, str(ROOT/'eval.py'), '--model', str(path),
-                    '--data', args.eval_data, '--output', str(output),
+                    '--data', args.eval_data, '--output', str(shard),
                     '--tp-size', str(args.tp_size), '--block-size', str(args.block_size),
                     '--max-tokens', str(args.eval_max_tokens),
                     '--batch-size', str(args.eval_batch_size), '--seed', str(args.eval_seed),
+                    '--num-shards', str(parallel.dp_size), '--shard-index', str(parallel.dp_rank),
                     '--inference-cache-fraction', str(args.inference_cache_fraction),
                     '--inference-max-prefill-tokens', str(args.inference_max_prefill_tokens),
                     '--inference-cuda-graph' if args.inference_cuda_graph else '--no-inference-cuda-graph',
                     '--inference-prefix-caching' if args.inference_prefix_caching else '--no-inference-prefix-caching']
-                print(f'Evaluating {path}; log: {output / "eval.log"}', flush=True)
+                print(f'Evaluating {path}, shard {parallel.dp_rank+1}/{parallel.dp_size}; '
+                      f'log: {shard / "eval.log"}', flush=True)
                 for attempt in range(args.inference_retries + 1):
-                    # Retry only incomplete evaluations, with the same questions and seed.
                     for name in ('predictions.jsonl', 'metrics.json'):
-                        (output/name).unlink(missing_ok=True)
+                        (shard/name).unlink(missing_ok=True)
                     if attempt and '--inference-cuda-graph' in command:
                         command[command.index('--inference-cuda-graph')] = '--no-inference-cuda-graph'
                     try:
-                        run_inference(command, env=env, log=output/'eval.log', progress=output/'progress',
+                        run_inference(command, env=env, log=shard/'eval.log', progress=shard/'progress',
                                       timeout=args.inference_progress_timeout)
                         break
                     except (RuntimeError, TimeoutError) as exc:
                         if attempt == args.inference_retries:
                             raise
                         print(f'{exc}; retrying evaluation with CUDA graph disabled', flush=True)
-                metrics = json.loads((output/'metrics.json').read_text())
+                metrics = json.loads((shard/'metrics.json').read_text())
+        except Exception as exc:
+            error = f'Evaluation failed for {path}: {exc}; see {shard / "eval.log"}'
+    errors = parallel.failures(error)
+    if errors:
+        raise RuntimeError('; '.join(errors))
+    error = [None]
+    if parallel.rank == 0:
+        try:
+            if parallel.dp_size > 1 and not complete:
+                metrics = merge_evaluations(output, parallel.dp_size)
             summary = {key: metrics[key] for key in
                        ('accuracy', 'correct', 'total', 'mean_tokens', 'truncated_rate', 'grading_timeouts')}
             print(json.dumps(dict(checkpoint=str(path), eval=summary)), flush=True)
         except Exception as exc:
-            error[0] = f'Evaluation failed for {path}: {exc}; see {output / "eval.log"}'
+            error[0] = f'Evaluation merge failed for {path}: {exc}'
     if parallel.world > 1:
         dist.broadcast_object_list(error, src=0, group=parallel.control_group)
     if error[0]:
         raise RuntimeError(error[0])
 
 
-def probe_entropy(model, responses, temperature, parallel):
-    values = [response_logps(model, response, temperature)[1] for response in responses]
+def probe_entropy(model, responses, temperature, parallel, phase_batch_size=1):
+    values = [response_logps(model, response, temperature, phase_batch_size)[1] for response in responses]
     entropy, tokens, count = parallel.sum_metrics([
         sum(values), sum(len(r.tokens) for r in responses), len(responses)])
     return {'probe/entropy': entropy/tokens, 'probe/tokens': tokens, 'probe/responses': count}
@@ -198,6 +219,7 @@ def train(args):
     assert args.inference_max_prefill_tokens > 0
     assert args.eval_every >= 0 and args.inference_progress_timeout > 0 and args.inference_retries >= 0
     assert args.entropy_probe_size >= 0 and args.entropy_probe_tokens > 0
+    assert args.train_phase_batch_size > 0
     if metadata:
         validate_resume(metadata, world, args.tp_size)
     torch.cuda.set_device(0)
@@ -217,6 +239,7 @@ def train(args):
     args.block_size = model_config.block_size
     assert args.block_size in (1,2,4,8,16,32,64,128), 'Block size must divide the 128-token phase padding'
     updates_per_round = args.batch_prompts * args.group_size // args.minibatch_size * args.ppo_epochs
+    single_update_grpo = args.objective == 'grpo' and updates_per_round == 1
     config = vars(args) | dict(world_size=world, dataset_rows=len(rows), total_steps=args.steps,
         algorithm=args.objective.upper(), policy_updates_per_batch=updates_per_round,
         kl_beta=0.0, master_dtype='float32', rollout_order='sequential',
@@ -225,6 +248,8 @@ def train(args):
         step_unit='rollout_round', microbatch_size_per_device=1)
     if rank == 0:
         print(f'Loaded {len(rows)} training examples from {args.data}', flush=True)
+        mode = 'single-pass on-policy GRPO' if single_update_grpo else 'two-pass with frozen old log-probs'
+        print(f'Likelihood: {mode}; phases per forward: {args.train_phase_batch_size}', flush=True)
     start = metadata['completed_steps'] if metadata else 0
     nonzero_updates = metadata['nonzero_updates'] if metadata else 0
     prior_elapsed = metadata['elapsed_seconds'] if metadata else 0.0
@@ -363,7 +388,7 @@ def train(args):
                 dist.barrier(group=parallel.control_group)
             probe = [Response(**record) for record in json.loads(probe_file.read_text())]
             if step == 0:
-                baseline = probe_entropy(model, probe, args.temperature, parallel)
+                baseline = probe_entropy(model, probe, args.temperature, parallel, args.train_phase_batch_size)
                 if rank == 0:
                     (output/'entropy-probe-step0.json').write_text(json.dumps(baseline, indent=2))
                     print(json.dumps(dict(step=0, **baseline)), flush=True)
@@ -375,15 +400,21 @@ def train(args):
                         prompt_ids=group[0].prompt,responses=[r.tokens for r in group],
                         finished=[r.finished for r in group],rewards=[r.reward for r in group],
                         advantages=[r.advantage for r in group]))+'\n')
-        print(f'Rank {rank}, round {step+1}: sampled {len(recs)} responses; caching old log-probs', flush=True)
-        cache_old_logps(model, recs, args.temperature)
+        print(f'Rank {rank}, round {step+1}: sampled {len(recs)} responses', flush=True)
+        if not single_update_grpo:
+            print(f'Rank {rank}: caching old log-probs', flush=True)
+            cache_old_logps(model, recs, args.temperature, args.train_phase_batch_size)
         updates = []
         local_batch = args.minibatch_size // dp_size
         for epoch in range(args.ppo_epochs):
             for mb in minibatches(recs, local_batch, args.seed+step*100000+epoch*1000+parallel.dp_rank):
                 optimizer.zero_grad(set_to_none=True)
-                stats = [backward_response(model, r, len(mb), args.temperature, args.clip, args.objective)
-                         for r in mb]
+                if single_update_grpo:
+                    stats = [backward_on_policy_grpo(model, r, len(mb), args.temperature,
+                                                    args.train_phase_batch_size) for r in mb]
+                else:
+                    stats = [backward_response(model, r, len(mb), args.temperature, args.clip,
+                                               args.objective, args.train_phase_batch_size) for r in mb]
                 parallel.reduce_gradients(model)
                 norm = parallel.clip_grad_norm(model)
                 optimizer.step()
@@ -414,7 +445,7 @@ def train(args):
             'time/total_seconds':prior_elapsed+time.time()-started,
             'system/gpu_peak_gib':torch.cuda.max_memory_allocated()/2**30}
         if probe is not None:
-            metrics.update(probe_entropy(model, probe, args.temperature, parallel))
+            metrics.update(probe_entropy(model, probe, args.temperature, parallel, args.train_phase_batch_size))
         if rank == 0:
             print(json.dumps(metrics), flush=True)
             with (output/'metrics.jsonl').open('a') as file:

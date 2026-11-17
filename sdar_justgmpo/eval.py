@@ -24,7 +24,8 @@ from runtime import format_prompt
 from inference_process import TokenProgress
 
 
-def evaluate(rows, rollout, tokenizer, reward, predictions, *, batch_size=1, seed=113, progress=None):
+def evaluate(rows, rollout, tokenizer, reward, predictions, *, batch_size=1, seed=113,
+             progress=None, start_index=0):
     correct = tokens = truncated = timeouts = 0
     for start in range(0, len(rows), batch_size):
         batch = rows[start:start+batch_size]
@@ -32,12 +33,12 @@ def evaluate(rows, rollout, tokenizer, reward, predictions, *, batch_size=1, see
         options = dict(do_sample=False)
         if progress is not None:
             options['progress'] = progress
-        samples = rollout.sample(prompts, 1, seed+start, **options)
+        samples = rollout.sample(prompts, 1, seed+start_index+start, **options)
         texts = [tokenizer.decode(ids, skip_special_tokens=True) for ids, _ in samples]
         scores, grading_timeouts = reward.score(texts,
             [row['ground_truth_answer'] for row in batch], [done for _, done in samples])
         timeouts += grading_timeouts
-        for index, (row, (ids, done), text, score) in enumerate(zip(batch, samples, texts, scores), start):
+        for index, (row, (ids, done), text, score) in enumerate(zip(batch, samples, texts, scores), start_index+start):
             predictions.write(json.dumps(dict(index=index, **row, response=text,
                 token_ids=ids, num_tokens=len(ids), finished=done, correct=bool(score)),
                 ensure_ascii=False)+'\n')
@@ -49,6 +50,31 @@ def evaluate(rows, rollout, tokenizer, reward, predictions, *, batch_size=1, see
     return dict(total=len(rows), correct=correct, accuracy=correct/len(rows),
         mean_tokens=tokens/len(rows), truncated=truncated, truncated_rate=truncated/len(rows),
         grading_timeouts=timeouts)
+
+
+def merge_evaluations(output, num_shards):
+    """Publish a complete evaluation only after every shard has succeeded."""
+    output = Path(output)
+    shards = [output/f'shard-{i}' for i in range(num_shards)]
+    parts = [json.loads((p/'metrics.json').read_text()) for p in shards]
+    records = [json.loads(line) for p in shards for line in (p/'predictions.jsonl').read_text().splitlines()]
+    records.sort(key=lambda row: row['index'])
+    total = sum(m['total'] for m in parts)
+    if [row['index'] for row in records] != list(range(total)):
+        raise ValueError('Evaluation shards must cover each question exactly once')
+    correct = sum(m['correct'] for m in parts)
+    truncated = sum(m['truncated'] for m in parts)
+    metrics = parts[0] | dict(output=str(output), total=total, correct=correct, accuracy=correct/total,
+        mean_tokens=sum(row['num_tokens'] for row in records)/total,
+        truncated=truncated, truncated_rate=truncated/total,
+        grading_timeouts=sum(m['grading_timeouts'] for m in parts),
+        elapsed_seconds=max(m['elapsed_seconds'] for m in parts), num_shards=num_shards)
+    metrics.pop('shard_index', None)
+    with (output/'predictions.jsonl').open('w') as file:
+        for row in records:
+            file.write(json.dumps(row, ensure_ascii=False)+'\n')
+    (output/'metrics.json').write_text(json.dumps(metrics, indent=2)+'\n')
+    return metrics
 
 
 def main():
@@ -67,6 +93,8 @@ def main():
     parser.add_argument('--inference-prefix-caching', action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument('--inference-max-prefill-tokens', type=int, default=4096)
     parser.add_argument('--seed', type=int, default=113)
+    parser.add_argument('--num-shards', type=int, default=1)
+    parser.add_argument('--shard-index', type=int, default=0)
     parser.add_argument('--limit', type=int, help='Evaluate only the first N rows for a smoke test')
     args = parser.parse_args()
     if min(args.tp_size, args.max_tokens, args.batch_size, args.inference_max_prefill_tokens) <= 0 or (args.limit is not None and args.limit <= 0):
@@ -76,6 +104,11 @@ def main():
     rows = load_math(args.data)
     if args.limit is not None:
         rows = rows[:args.limit]
+    if not 0 <= args.shard_index < args.num_shards <= len(rows):
+        parser.error('Require 0 <= shard-index < num-shards <= number of questions')
+    start_index = len(rows)*args.shard_index//args.num_shards
+    stop_index = len(rows)*(args.shard_index+1)//args.num_shards
+    rows = rows[start_index:stop_index]
     output = Path(args.output)
     output.mkdir(parents=True, exist_ok=True)
     if (output/'predictions.jsonl').exists() or (output/'metrics.json').exists():
@@ -103,6 +136,7 @@ def main():
         with (output/'predictions.jsonl').open('x') as predictions:
             metrics = evaluate(rows, rollout, tokenizer, reward, predictions,
                                batch_size=args.batch_size, seed=args.seed,
+                               start_index=start_index,
                                progress=TokenProgress(output/'progress'))
         metrics['elapsed_seconds'] = time.monotonic()-started
     (output/'metrics.json').write_text(json.dumps(config | metrics, indent=2)+'\n')

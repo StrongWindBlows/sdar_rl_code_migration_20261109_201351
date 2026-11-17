@@ -21,10 +21,11 @@ class CheckpointTests(unittest.TestCase):
             ppo_epochs=1,max_tokens=3000,lr=5e-6,temperature=1.,seed=1234,clip=.4,objective='gmpo',
             block_size=32,tp_size=2,steps=30,rollout_batch_size=1,inference_cache_fraction=.06,
             inference_cuda_graph=True,inference_prefix_caching=False,inference_max_prefill_tokens=4096,train_tf32=False,
-            eval_data='test.jsonl',eval_max_tokens=3000,eval_batch_size=1,eval_seed=113)
+            eval_data='test.jsonl',eval_max_tokens=3000,eval_batch_size=1,eval_seed=113,train_phase_batch_size=1)
         metadata = dict(config=saved,completed_steps=10)
         tuning = dict(rollout_batch_size=32,inference_cache_fraction=.3,inference_cuda_graph=False,
-                      inference_prefix_caching=True,inference_max_prefill_tokens=8192,eval_batch_size=32,train_tf32=True)
+                      inference_prefix_caching=True,inference_max_prefill_tokens=8192,eval_batch_size=32,
+                      train_tf32=True,train_phase_batch_size=4)
         args = argparse.Namespace(**(saved | tuning))
         explicit = (set(tuning)-{'inference_cuda_graph'}) | {'no_inference_cuda_graph'}
         apply_resume_config(args,metadata,explicit)
@@ -38,9 +39,12 @@ class CheckpointTests(unittest.TestCase):
         # Older checkpoints need not contain newly introduced engine options.
         legacy = saved.copy()
         legacy.pop('inference_cache_fraction')
+        legacy.pop('train_phase_batch_size')
         args.inference_cache_fraction = .3
+        args.train_phase_batch_size = 4
         apply_resume_config(args,dict(config=legacy,completed_steps=10),set())
         self.assertEqual(args.inference_cache_fraction,.3)
+        self.assertEqual(args.train_phase_batch_size,4)
 
     def test_real_entityless_offline_path(self):
         identity = dict(id='gjz7p1b3', path='sdar-justgmpo/gjz7p1b3')

@@ -47,35 +47,55 @@ def policy_loss(new_logps, old_logps, advantages, mask, epsilon=0.4, objective='
     return -advantages * weight
 
 
-def phase_logps(model, response, temperature=1.0):
+def phase_logps(model, response, temperature=1.0, phase_batch_size=1):
     device = next(model.parameters()).device
-    for ids, positions, targets, labels in phase_inputs(
-            response, model.config.block_size, model.config.mask_token_id, device):
+    for ids, positions, targets, labels, phase_count in phase_inputs(
+            response, model.config.block_size, model.config.mask_token_id, device, phase_batch_size):
         context = torch.autocast('cuda', dtype=torch.bfloat16) if device.type == 'cuda' else nullcontext()
         with context:
-            logps, entropy = model(ids, positions, targets, labels, model.config.vocab_size, temperature)
-        yield targets - len(response.prompt), logps, entropy
+            logps, entropy = model(ids, positions, targets, labels, model.config.vocab_size,
+                                   temperature, phase_count)
+        yield positions[0, targets] - len(response.prompt), logps, entropy
 
 
 @torch.no_grad()
-def response_logps(model, response, temperature=1.0):
+def response_logps(model, response, temperature=1.0, phase_batch_size=1):
     logps = torch.empty(len(response.tokens), device=next(model.parameters()).device)
     entropy_sum = 0.0
-    for offsets, values, entropy in phase_logps(model, response, temperature):
+    for offsets, values, entropy in phase_logps(model, response, temperature, phase_batch_size):
         logps[offsets] = values
         entropy_sum += entropy.sum().item()
     return logps, entropy_sum
 
 
 @torch.no_grad()
-def cache_old_logps(model, responses, temperature=1.0):
+def cache_old_logps(model, responses, temperature=1.0, phase_batch_size=1):
     """Call once, before ANY optimizer update on this rollout batch."""
     for response in responses:
-        response.old_logps = response_logps(model, response, temperature)[0].cpu()
+        response.old_logps = response_logps(model, response, temperature, phase_batch_size)[0].cpu()
+
+
+def backward_on_policy_grpo(model, response, minibatch_size, temperature=1.0, phase_batch_size=1):
+    """One forward/backward per phase group, only for one update per rollout batch.
+
+    Before that update, old and current policies coincide: ratio=1, but its
+    derivative is grad(logp). Detaching only the denominator preserves both.
+    """
+    stats = dict(loss=-response.advantage, entropy_sum=0.0, tokens=0, clipped=0,
+                 log_ratio_sum=0.0, log_ratio_square_sum=0.0, log_ratio_abs_max=0.0)
+    if response.advantage == 0:
+        return stats
+    for _, logps, entropy in phase_logps(model, response, temperature, phase_batch_size):
+        ratio = (logps - logps.detach()).exp()
+        loss = -response.advantage * ratio.sum() / len(response.tokens) / minibatch_size
+        loss.backward()
+        stats['entropy_sum'] += entropy.sum().item()
+    stats['tokens'] = len(response.tokens)
+    return stats
 
 
 def backward_response(model, response, minibatch_size, temperature=1.0,
-                      epsilon=0.4, objective='gmpo'):
+                      epsilon=0.4, objective='gmpo', phase_batch_size=1):
     """Two-pass, phase-streamed gradient of the complete response objective.
 
     The first pass computes q=exp(mean(clipped log-ratio)). The second pass
@@ -86,14 +106,14 @@ def backward_response(model, response, minibatch_size, temperature=1.0,
     if response.advantage == 0:
         return dict(loss=0.0, entropy_sum=0.0, tokens=0, clipped=0,
                     log_ratio_sum=0.0, log_ratio_square_sum=0.0, log_ratio_abs_max=0.0)
-    current, entropy_sum = response_logps(model, response, temperature)
+    current, entropy_sum = response_logps(model, response, temperature, phase_batch_size)
     old = response.old_logps.to(current.device)
     advantage = current.new_tensor(response.advantage)
     clipped = clipped_log_ratio(current, old, advantage, epsilon)
     sequence_weight = clipped.mean().exp().detach()
     loss_value = policy_loss(current, old, advantage, torch.ones_like(current, dtype=torch.bool),
                              epsilon, objective).item()
-    for offsets, logps, _ in phase_logps(model, response, temperature):
+    for offsets, logps, _ in phase_logps(model, response, temperature, phase_batch_size):
         phase_clipped = clipped_log_ratio(logps, old[offsets], advantage, epsilon)
         terms = sequence_weight * phase_clipped if objective == 'gmpo' else phase_clipped.exp()
         loss = -advantage * terms.sum() / len(response.tokens) / minibatch_size

@@ -14,6 +14,8 @@ export BATCH_PROMPTS="${BATCH_PROMPTS:-128}"
 export GROUP_SIZE="${GROUP_SIZE:-8}"
 export MINIBATCH_SIZE="${MINIBATCH_SIZE:-$((BATCH_PROMPTS * GROUP_SIZE))}"
 export PPO_EPOCHS="${PPO_EPOCHS:-1}"
+# 每次前向合并的 phase 数，共享一份 clean；1 为逐 phase。
+export TRAIN_PHASE_BATCH_SIZE="${TRAIN_PHASE_BATCH_SIZE:-4}"
 export CLIP="${CLIP:-0.4}"  # log-ratio clipping
 export SEED="${SEED:-1234}"
 
