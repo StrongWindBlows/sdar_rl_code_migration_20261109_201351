@@ -192,6 +192,29 @@ JustGRPO 原论文也展示过顺序训练后并行推理的准确率与效率�
 
 我希望方法简洁，能解释每一个新增项为何存在。优先复用现有参数和 full-mask phase；若需要 critic、独立教师、额外 head 或第二类 rollout，说明它解决的具体不可辨识性或估计问题。没有成立的结论时，请直接指出缺口，不要预设必须得到 1+1 大于 2。
 
+## 数学复核与当前验证范围
+
+目前的结论是：附录目标在规范化概率与可微条件下的梯度成立，但目标提高不保证顺序能力与并行能力同时提高，也没有直接优化当前动态解码的实际成本。
+
+一个两 token 反例可以完全枚举。两个二元 token 相同则奖励为 1；顺序模式先均匀生成第一个 token，第二个以概率 p 与第一个相同。并行模式的两个位置分别均匀独立采样。令 beta 为 0.3，得到：
+
+| p | 顺序准确率 | 并行准确率 | KL | 耦合目标 |
+| --- | --- | --- | --- | --- |
+| 0.99 | 99% | 50% | 0.637146 | 0.798856 |
+| 0.98 | 98% | 50% | 0.595108 | 0.801468 |
+
+目标提高、顺序能力下降、并行能力不变。该起点的目标梯度也倾向于降低 p。这说明降低分布差异可能通过削弱顺序相关性实现，不能把正确梯度当成双向收益的证明。规范化与 EOS 边缘化、共享参数的完整梯度、未提交独立候选的零奖励梯度，以及这个反例，均已作为可枚举测试保留。
+
+当前只实现验证所需的概率接口和分析入口。`phase_inputs(..., reconstruct=True)` 在 phase 0 增加全块有效目标；`reconstruction_phases` 同时返回顺序与 full-mask 的位置、log-prob 和 entropy。重叠的第一个 token 只计算一次词表投影。现有 GRPO 和 GMPO 调用默认关闭该选项。
+
+`logit_chunk_size` 对词表投影分块，控制无梯度分析的临时显存；带梯度时，各分块计算图仍保留到 backward。共享骨干已通过独立串行 oracle 的概率与梯度对照，第一 token、混合 prompt 块、EOS 和末块 padding 都有覆盖。
+
+这些接口不自动解决完整耦合梯度的计算依赖：整条回答的概率差在遍历结束后才得到，而原训练逐 phase 立即反传并释放图。若接入完整目标，需要在额外统计遍历、保留图或可验证的采样概率记录之间作选择。
+
+离线分析将概率差标作 `logp_gap`，保留每条回答的原始值、每 token 值及其方差、正确与错误分组、reward 和长度相关性。它不会将该值宣称为当前置信度动态解码的精确 KL；离线 BF16 重算也不是原采样器梯度的直接证明。
+
+统一解码评测提供 `count` 与 `timing` 两种模式。前者复用 GA 的逐 forward 事件，核对提交 token 与返回 token，并报告池化 TPF；后者使用原生 Rollout，不装事件计数钩子，forward 数与 TPF 留空。两种模式均比较相同权重、数据、TP1、batch、精度、CUDA graph 设置与最大长度。真实速度只比较同种模式与同等硬件条件下的耗时。
+
 ## 附录 已有候选推导供审查
 
 以下是此前讨论中的一个候选方向，**不是要求采用的方案**。请在完成独立建模后检查它的成立条件、价值与局限。
@@ -255,6 +278,9 @@ D_{\mathrm{KL}}\!\left(S_B\middle\|\prod_jq_j\right)
 | `sdar_justgmpo/train.py` | `make_responses`、`single_update_grpo`、采样与更新循环 |
 | `sdar_justgmpo/algorithm.py` | `group_advantages`、`phase_logps`、`backward_on_policy_grpo`、通用更新 |
 | `sdar_justgmpo/likelihood.py` | `phase_inputs`、`packed_attention`、`SDARPolicy.forward` |
+| `sdar_justgmpo/analyze_reconstruction.py` | `read_rollouts`、`score_response`，已有轨迹的顺序与 full-mask 概率分析 |
+| `sdar_justgmpo/eval_decoding.py` | 统一顺序、固定连续分组、动态阈值解码的计数与计时入口 |
+| `sdar_justgmpo/tests/test_decode_consistency.py` | 数学反例、规范化与 EOS、重建概率与梯度、前向计数测试 |
 | `sdar_justgmpo/rollout.py` | `Rollout`、顺序引擎配置、首个 EOS 处理 |
 | `sdar_justgmpo/reward.py` | 二值数学判分与截断处理 |
 | `DiRL/lmdeploy/pytorch/strategies/dllm/model_agent.py` | `slice_outputs`、`post_sampling`，当前块预测与提交 |
@@ -266,7 +292,41 @@ D_{\mathrm{KL}}\!\left(S_B\middle\|\prod_jq_j\right)
 
 动态汇总在 `sdar_justgmpo/runs/dynamic-allsteps-20261117-161412/`，包括 `comparison.csv`、`summary.json`、`measure_dynamic.py`，以及逐权重的 `predictions.jsonl`、`metrics.json` 和事件记录。部分基座与 Step 5、Step 8 结果通过符号链接复用此前同设置的完整 500 题评测。
 
-当前代码尚未加入本文设想的 full-mask 重建或协同 RL 目标；现有共享 phase 和单次更新 GRPO 是可复用的实现基础。
+当前训练主循环尚未加入协同 RL 目标。新增 full-mask 接口与离线工具用于验证信号和计算成本，现有共享 phase 和单次更新 GRPO 继续作为训练基础。
+
+## 验证入口用法
+
+以下命令从项目根目录执行，输出使用独立目录。分析 Step 1 时必须使用更新前的基座权重；分析其他轮次时，应使用对应轮次采样前的权重，而不是该轮更新后的检查点。
+
+```bash
+SDAR_PYTHON=/ssd_data/liuyang/miniconda3/envs/dirl/bin/python
+SDAR_RUN=sdar_justgmpo/runs/sdar4b-grpo-phase4-20261116-155816
+CUDA_VISIBLE_DEVICES=4 "$SDAR_PYTHON" sdar_justgmpo/analyze_reconstruction.py \
+  --model /ssd_data/liuyang/hug/model/SDAR-4B-Chat-b32 \
+  --rollouts "$SDAR_RUN/rollouts-rank0.jsonl" "$SDAR_RUN/rollouts-rank2.jsonl" \
+  --step 1 --limit 32 --block-size 32 --phase-batch-size 4 \
+  --logit-chunk-size 128 --output sdar_justgmpo/runs/reconstruction-step1
+```
+
+分析输出 `config.json`、逐回答及逐 token 概率的 `responses.jsonl`、分组统计的 `summary.json`。加 `--benchmark` 会在每条选中轨迹上预热两条重算路径，再测量顺序重算和合并重建的耗时、峰值分配显存及顺序概率差异；这不是反向传播或训练速度测试。
+
+完整 500 题的统一计数评测如下，默认不会限制题数。`fixed-4` 表示每次提交连续 4 个位置；动态策略可以提交不连续位置。
+
+```bash
+CUDA_VISIBLE_DEVICES=4 "$SDAR_PYTHON" sdar_justgmpo/eval_decoding.py \
+  --model "$SDAR_RUN/inference-step-6" \
+  --data /ssd_data/liuyang/hug/data/JustGRPO-MATH-500/test.jsonl \
+  --parallel-tokens 2 4 8 --thresholds 0.9 0.95 0.99 \
+  --block-size 32 --batch-size 1 --max-tokens 3000 --mode count \
+  --output sdar_justgmpo/runs/decoding-step6-count
+```
+
+改为 `--mode timing` 并指定新的输出目录，得到无事件钩子的原生生成耗时。`--save-events` 可在 count 模式额外保存压缩事件。各解码设置分别保存逐题结果与 metrics，根目录保存 `summary.json` 和 `comparison.csv`。`--start-index`、`--limit` 仅用于指定题目范围；应在结果中保留该范围，不能把短检查当成 500 题效果。
+
+```bash
+cd sdar_justgmpo
+"$SDAR_PYTHON" tests/run_cpu_tests.py
+```
 
 ## 相关原始资料
 
