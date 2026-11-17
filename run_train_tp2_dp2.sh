@@ -7,7 +7,8 @@ export MODEL="${MODEL:-$ROOT/../hug/model/SDAR-4B-Chat-b32}"
 export DATA="${DATA:-$ROOT/../hug/data/JustGRPO-MATH-500/train.jsonl}"
 
 # 训练配置：每轮将全部回答作为一个 minibatch，默认每轮更新一次。
-export OBJECTIVE="${OBJECTIVE:-grpo}"  # gmpo 或 grpo
+export OBJECTIVE="${OBJECTIVE:-grpo}"  # gmpo、grpo 或 coupled
+export COUPLING_BETA="${COUPLING_BETA:-1e-4}"  # coupled 的完整回答 KL 系数
 export LR="${LR:-5e-6}"
 export STEPS="${STEPS:-5}"
 export BATCH_PROMPTS="${BATCH_PROMPTS:-128}"
@@ -16,6 +17,7 @@ export MINIBATCH_SIZE="${MINIBATCH_SIZE:-$((BATCH_PROMPTS * GROUP_SIZE))}"
 export PPO_EPOCHS="${PPO_EPOCHS:-1}"
 # 每次前向合并的 phase 数，共享一份 clean；1 为逐 phase。
 export TRAIN_PHASE_BATCH_SIZE="${TRAIN_PHASE_BATCH_SIZE:-4}"
+export TRAIN_LOGIT_CHUNK_SIZE="${TRAIN_LOGIT_CHUNK_SIZE:-128}"
 export CLIP="${CLIP:-0.4}"  # log-ratio clipping
 export SEED="${SEED:-1234}"
 

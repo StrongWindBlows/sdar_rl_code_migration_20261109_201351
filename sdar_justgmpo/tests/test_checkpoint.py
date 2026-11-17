@@ -16,6 +16,19 @@ from run_state import resume_wandb
 
 
 class CheckpointTests(unittest.TestCase):
+    def test_coupled_resume_inherits_beta_and_rejects_an_objective_change(self):
+        config = dict(objective='coupled', coupling_beta=1e-4, steps=5)
+        metadata = dict(config=config, completed_steps=2)
+        args = argparse.Namespace(objective='gmpo', coupling_beta=.1, steps=5)
+        apply_resume_config(args, metadata, set())
+        self.assertEqual((args.objective, args.coupling_beta), ('coupled', 1e-4))
+        args.coupling_beta = .01
+        with self.assertRaisesRegex(ValueError, 'Cannot change --coupling-beta'):
+            apply_resume_config(args, metadata, {'coupling_beta'})
+        args.objective = 'grpo'
+        with self.assertRaisesRegex(ValueError, 'Cannot change --objective'):
+            apply_resume_config(args, metadata, {'objective'})
+
     def test_resume_can_tune_runtime_settings_and_inherits_omitted_ones(self):
         saved = dict(model='model',data='data',batch_prompts=128,group_size=8,minibatch_size=128,
             ppo_epochs=1,max_tokens=3000,lr=5e-6,temperature=1.,seed=1234,clip=.4,objective='gmpo',

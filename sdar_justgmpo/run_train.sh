@@ -32,6 +32,7 @@ LR="${LR:-1e-6}"
 # LOG-ratio clipping，0.4 对应 ratio [exp(-0.4), exp(0.4)]。
 CLIP="${CLIP:-0.4}"
 OBJECTIVE="${OBJECTIVE:-gmpo}"  # grpo 提供相同批内更新与clip范围的对照。
+COUPLING_BETA="${COUPLING_BETA:-1e-4}"
 SEED="${SEED:-1234}"
 # STEPS 是 rollout 轮数。默认50轮 = 400次 optimizer 更新。
 STEPS="${STEPS:-50}"
@@ -52,6 +53,7 @@ ENTROPY_PROBE_SIZE="${ENTROPY_PROBE_SIZE:-0}"
 ENTROPY_PROBE_TOKENS="${ENTROPY_PROBE_TOKENS:-128}"
 TRAIN_TF32="${TRAIN_TF32:-true}"
 TRAIN_PHASE_BATCH_SIZE="${TRAIN_PHASE_BATCH_SIZE:-1}"
+TRAIN_LOGIT_CHUNK_SIZE="${TRAIN_LOGIT_CHUNK_SIZE:-128}"
 RUN_TAG="${RUN_TAG:-sdar4b-just${OBJECTIVE}-math-rbs${ROLLOUT_BATCH_SIZE}}"
 OUTPUT="${OUTPUT:-$SCRIPT_DIR/runs/$RUN_TAG}"
 RESUME="${RESUME:-}"
@@ -86,11 +88,13 @@ else
         --batch-prompts "$BATCH_PROMPTS" --group-size "$GROUP_SIZE" --minibatch-size "$MINIBATCH_SIZE"
         --ppo-epochs "$PPO_EPOCHS" --max-tokens "$MAX_TOKENS"
         --temperature "$TEMPERATURE" --lr "$LR" --clip "$CLIP" --objective "$OBJECTIVE" --tp-size "$TP_SIZE"
+        --coupling-beta "$COUPLING_BETA"
         --seed "$SEED" --steps "$STEPS" --save-every "$SAVE_EVERY")
     if [[ -n "$BLOCK_SIZE" ]]; then COMMAND+=(--block-size "$BLOCK_SIZE"); fi
 fi
 COMMAND+=(--rollout-batch-size "$ROLLOUT_BATCH_SIZE"
     --train-phase-batch-size "$TRAIN_PHASE_BATCH_SIZE"
+    --train-logit-chunk-size "$TRAIN_LOGIT_CHUNK_SIZE"
     --inference-cache-fraction "$INFERENCE_CACHE_FRACTION"
     --inference-max-prefill-tokens "$INFERENCE_MAX_PREFILL_TOKENS"
     --inference-progress-timeout "$INFERENCE_PROGRESS_TIMEOUT" --inference-retries "$INFERENCE_RETRIES"

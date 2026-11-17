@@ -24,6 +24,7 @@ from transformers import AutoTokenizer, GenerationConfig
 
 from algorithm import (Response, group_advantages, cache_old_logps, backward_response,
                        backward_on_policy_grpo, response_logps)
+from cooperative import prepare_coupled, backward_coupled
 from data import load_math
 from eval import merge_evaluations
 from likelihood import SDARPolicy
@@ -64,11 +65,15 @@ def arguments():
     p.add_argument('--train-tf32', action=argparse.BooleanOptionalAction, default=True)
     p.add_argument('--train-phase-batch-size', type=int, default=1,
                    help='Phases per learner forward, sharing one clean branch')
+    p.add_argument('--train-logit-chunk-size', type=int, default=128,
+                   help='Vocabulary projection targets per chunk for the coupled objective')
     p.add_argument('--block-size', type=int, choices=[1,2,4,8,16,32,64,128], default=None,
                    help='Shared learner/rollout block size; default: model config (legacy fallback 4)')
     p.add_argument('--tp-size',type=int,default=1,help='Learner and rollout tensor-parallel size')
     p.add_argument('--dp-size',type=int,default=None,help='Optional check of WORLD_SIZE / tp-size')
-    p.add_argument('--objective', choices=['gmpo','grpo'], default='gmpo')
+    p.add_argument('--objective', choices=['gmpo','grpo','coupled'], default='gmpo')
+    p.add_argument('--coupling-beta', type=float, default=1e-4,
+                   help='Full-answer KL coefficient for E_S[R] - beta * KL(S || P)')
     p.add_argument('--clip', type=float, default=0.4, help='Symmetric LOG-ratio clipping radius')
     p.add_argument('--lr', type=float, default=1e-6)
     p.add_argument('--temperature', type=float, default=1.0)
@@ -220,6 +225,7 @@ def train(args):
     assert args.eval_every >= 0 and args.inference_progress_timeout > 0 and args.inference_retries >= 0
     assert args.entropy_probe_size >= 0 and args.entropy_probe_tokens > 0
     assert args.train_phase_batch_size > 0
+    assert args.train_logit_chunk_size > 0 and args.coupling_beta >= 0
     if metadata:
         validate_resume(metadata, world, args.tp_size)
     torch.cuda.set_device(0)
@@ -240,15 +246,26 @@ def train(args):
     assert args.block_size in (1,2,4,8,16,32,64,128), 'Block size must divide the 128-token phase padding'
     updates_per_round = args.batch_prompts * args.group_size // args.minibatch_size * args.ppo_epochs
     single_update_grpo = args.objective == 'grpo' and updates_per_round == 1
+    coupled = args.objective == 'coupled'
+    if coupled and updates_per_round != 1:
+        raise ValueError('The coupled objective requires exactly one update per rollout batch')
     config = vars(args) | dict(world_size=world, dataset_rows=len(rows), total_steps=args.steps,
         algorithm=args.objective.upper(), policy_updates_per_batch=updates_per_round,
         kl_beta=0.0, master_dtype='float32', rollout_order='sequential',
         top_k=0, top_p=1.0, eos_policy='include_first_eos_then_stop',
         truncated_reward=0.0, loss_normalization='mean_responses(mean_valid_tokens)',
         step_unit='rollout_round', microbatch_size_per_device=1)
+    if coupled:
+        config.update(kl_beta=args.coupling_beta,
+            loss_normalization='mean_responses(sum_valid_tokens)',
+            advantage_normalization='leave_one_out(reward - coupling_beta * sequence_logp_gap)',
+            coupling_parallel_policy='independent_current_block_given_clean_history',
+            coupling_objective='E_S[reward] - coupling_beta * KL(S || P)')
     if rank == 0:
         print(f'Loaded {len(rows)} training examples from {args.data}', flush=True)
         mode = 'single-pass on-policy GRPO' if single_update_grpo else 'two-pass with frozen old log-probs'
+        if coupled:
+            mode = f'coupled on-policy gradient, beta={args.coupling_beta:g}; statistics + shared backward'
         print(f'Likelihood: {mode}; phases per forward: {args.train_phase_batch_size}', flush=True)
     start = metadata['completed_steps'] if metadata else 0
     nonzero_updates = metadata['nonzero_updates'] if metadata else 0
@@ -378,6 +395,14 @@ def train(args):
         if errors:
             abort(step, f'Rollout or grading failed: {errors}')
         rollout_seconds = time.time()-tick
+        if coupled:
+            statistics_started = time.time()
+            progress = (lambda done, total: print(
+                f'Rank {rank}, round {step+1}: coupling statistics {done}/{total}', flush=True)
+                ) if parallel.tp_rank == 0 else None
+            gaps = prepare_coupled(model, recs, args.group_size, args.coupling_beta,
+                args.temperature, args.train_phase_batch_size, args.train_logit_chunk_size, progress)
+            statistics_seconds = time.time()-statistics_started
         if args.entropy_probe_size and probe is None:
             probe_file = output/f'entropy-probe-dp{parallel.dp_rank}.json'
             if parallel.tp_rank == 0 and not probe_file.exists():
@@ -399,9 +424,10 @@ def train(args):
                     file.write(json.dumps(dict(step=step+1,question=row['question'],answer=row['ground_truth_answer'],
                         prompt_ids=group[0].prompt,responses=[r.tokens for r in group],
                         finished=[r.finished for r in group],rewards=[r.reward for r in group],
-                        advantages=[r.advantage for r in group]))+'\n')
+                        advantages=[r.advantage for r in group],
+                        **(dict(logp_gaps=gaps[i*args.group_size:(i+1)*args.group_size]) if coupled else {})))+'\n')
         print(f'Rank {rank}, round {step+1}: sampled {len(recs)} responses', flush=True)
-        if not single_update_grpo:
+        if not (single_update_grpo or coupled):
             print(f'Rank {rank}: caching old log-probs', flush=True)
             cache_old_logps(model, recs, args.temperature, args.train_phase_batch_size)
         updates = []
@@ -409,7 +435,14 @@ def train(args):
         for epoch in range(args.ppo_epochs):
             for mb in minibatches(recs, local_batch, args.seed+step*100000+epoch*1000+parallel.dp_rank):
                 optimizer.zero_grad(set_to_none=True)
-                if single_update_grpo:
+                if coupled:
+                    stats = []
+                    for i, response in enumerate(mb, 1):
+                        stats.append(backward_coupled(model, response, len(mb), args.coupling_beta,
+                            args.temperature, args.train_phase_batch_size, args.train_logit_chunk_size))
+                        if parallel.tp_rank == 0 and (i % 32 == 0 or i == len(mb)):
+                            print(f'Rank {rank}, round {step+1}: coupled backward {i}/{len(mb)}', flush=True)
+                elif single_update_grpo:
                     stats = [backward_on_policy_grpo(model, r, len(mb), args.temperature,
                                                     args.train_phase_batch_size) for r in mb]
                 else:
@@ -444,6 +477,19 @@ def train(args):
             'time/rollout_seconds_rank0':rollout_seconds,'time/step_seconds':time.time()-tick,
             'time/total_seconds':prior_elapsed+time.time()-started,
             'system/gpu_peak_gib':torch.cuda.max_memory_allocated()/2**30}
+        if coupled:
+            gap_sum, gap2_sum, coefficient2_sum, full_entropy = sum_metrics([
+                sum(gaps), sum(g*g for g in gaps), sum(r.advantage**2 for r in recs),
+                sum(s['full_mask_entropy_sum'] for s in stats)])
+            metrics.update({'coupling/beta':args.coupling_beta,
+                'coupling/mean_logp_gap':gap_sum/count,
+                'coupling/logp_gap_std':max(0.0, gap2_sum/count-(gap_sum/count)**2)**0.5,
+                'coupling/gap_per_token':gap_sum/length,
+                'coupling/mean_penalty':args.coupling_beta*gap_sum/count,
+                'coupling/coefficient_rms':(coefficient2_sum/count)**0.5,
+                'coupling/full_mask_entropy':full_entropy/length,
+                'coupling/objective_estimate':(correct-args.coupling_beta*gap_sum)/count,
+                'time/coupling_statistics_seconds_rank0':statistics_seconds})
         if probe is not None:
             metrics.update(probe_entropy(model, probe, args.temperature, parallel, args.train_phase_batch_size))
         if rank == 0:

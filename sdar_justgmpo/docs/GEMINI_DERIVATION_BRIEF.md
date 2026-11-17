@@ -205,7 +205,7 @@ JustGRPO 原论文也展示过顺序训练后并行推理的准确率与效率�
 
 目标提高、顺序能力下降、并行能力不变。该起点的目标梯度也倾向于降低 p。这说明降低分布差异可能通过削弱顺序相关性实现，不能把正确梯度当成双向收益的证明。规范化与 EOS 边缘化、共享参数的完整梯度、未提交独立候选的零奖励梯度，以及这个反例，均已作为可枚举测试保留。
 
-当前只实现验证所需的概率接口和分析入口。`phase_inputs(..., reconstruct=True)` 在 phase 0 增加全块有效目标；`reconstruction_phases` 同时返回顺序与 full-mask 的位置、log-prob 和 entropy。重叠的第一个 token 只计算一次词表投影。现有 GRPO 和 GMPO 调用默认关闭该选项。
+概率接口 `phase_inputs(..., reconstruct=True)` 在 phase 0 增加全块有效目标；`reconstruction_phases` 同时返回顺序与 full-mask 的位置、log-prob 和 entropy。重叠的第一个 token 只计算一次词表投影。现有 GRPO 和 GMPO 调用默认关闭该选项。
 
 `logit_chunk_size` 对词表投影分块，控制无梯度分析的临时显存；带梯度时，各分块计算图仍保留到 backward。共享骨干已通过独立串行 oracle 的概率与梯度对照，第一 token、混合 prompt 块、EOS 和末块 padding 都有覆盖。
 
@@ -292,7 +292,21 @@ D_{\mathrm{KL}}\!\left(S_B\middle\|\prod_jq_j\right)
 
 动态汇总在 `sdar_justgmpo/runs/dynamic-allsteps-20261117-161412/`，包括 `comparison.csv`、`summary.json`、`measure_dynamic.py`，以及逐权重的 `predictions.jsonl`、`metrics.json` 和事件记录。部分基座与 Step 5、Step 8 结果通过符号链接复用此前同设置的完整 500 题评测。
 
-当前训练主循环尚未加入协同 RL 目标。新增 full-mask 接口与离线工具用于验证信号和计算成本，现有共享 phase 和单次更新 GRPO 继续作为训练基础。
+训练入口现已增加 `--objective coupled`，实现附录中的候选目标。`cooperative.py` 先无梯度重算整条回答的 d，再对同题回答的 `reward - beta*d` 使用 leave-one-out baseline，最后逐 phase 合并顺序与 full-mask 损失反传。每批只允许一次更新；不使用组内标准差或回答长度归一化。其他回答组成的 baseline 与当前样本条件独立，所有统计系数在梯度遍历时冻结。这个估计针对固定整块并行分布，动态阈值解码的收益仍须评测。
+
+与原 GRPO 相比，模型、数据、采样量、学习率及优化器设置可以保持一致；目标和归一化方式不同，训练算力开销也不同。零奖励或零顺序系数的回答仍可能提供 full-mask 的直接梯度，不能沿用原来的零 advantage 跳过逻辑。
+
+五步实验的启动配置可由现有脚本覆盖：
+
+```bash
+CUDA_VISIBLE_DEVICES=4,5,6,7 OBJECTIVE=coupled COUPLING_BETA=1e-4 \
+  STEPS=5 EVAL_EVERY=1 SAVE_EVERY=5 \
+  TORCHRUN_BIN=/ssd_data/liuyang/miniconda3/envs/dirl/bin/torchrun \
+  OUTPUT="$PWD/sdar_justgmpo/runs/sdar4b-coupled-beta1e-4-5steps" \
+  bash run_train_tp2_dp2.sh
+```
+
+输出中 `config.json` 保存全部参数；`rollouts-rank*.jsonl` 保留完整回答概率差与实际系数；`metrics.jsonl` 记录 gap、惩罚量级、full-mask 熵及目标的样本估计。每步评测保留 BF16 权重，最后一步另存 FP32 主权重、Adam 与 RNG，支持严格续跑。
 
 ## 验证入口用法
 

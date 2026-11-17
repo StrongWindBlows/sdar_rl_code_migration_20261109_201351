@@ -16,14 +16,14 @@ import torch.distributed as dist
 FORMAT_VERSION = 1
 TRAINING_KEYS = (
     'model', 'data', 'batch_prompts', 'group_size', 'minibatch_size', 'ppo_epochs',
-    'max_tokens', 'lr', 'temperature', 'seed', 'clip', 'objective', 'block_size', 'tp_size',
+    'max_tokens', 'lr', 'temperature', 'seed', 'clip', 'objective', 'block_size', 'tp_size', 'coupling_beta',
 )
 RUNTIME_KEYS = (
     'rollout_batch_size', 'inference_cache_fraction', 'inference_cuda_graph',
     'inference_prefix_caching', 'inference_max_prefill_tokens', 'train_tf32',
     'eval_data', 'eval_max_tokens', 'eval_batch_size', 'eval_seed',
     'eval_every', 'eval_at_start', 'inference_progress_timeout', 'inference_retries',
-    'entropy_probe_size', 'entropy_probe_tokens', 'train_phase_batch_size',
+    'entropy_probe_size', 'entropy_probe_tokens', 'train_phase_batch_size', 'train_logit_chunk_size',
 )
 
 
@@ -80,7 +80,7 @@ def apply_resume_config(args, metadata, explicit_options):
     explicit_options = {key.removeprefix('no_') for key in explicit_options}
     saved = metadata['config']
     for key in TRAINING_KEYS:
-        default = 1 if key == 'tp_size' else None
+        default = {'tp_size':1, 'coupling_beta':1e-4}.get(key)
         value = getattr(args, key, default)
         saved_value = saved.get(key, default)
         if key in explicit_options:
