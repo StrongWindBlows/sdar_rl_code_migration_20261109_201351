@@ -59,6 +59,13 @@ def packed_attention(n: int, block_size: int, device: str, phase_count=1):
     return create_block_mask(visible, B=None, H=None, Q_LEN=length, KV_LEN=length, device=device)
 
 
+def projected_token_probability(weight, hidden, tokens):
+    """Full-vocabulary scores at recorded decode positions."""
+    logits = F.linear(hidden.to(weight.dtype), weight).float()
+    targets = logits.gather(1, tokens[:, None]).squeeze(1)
+    return (targets - logits.logsumexp(dim=-1)).exp(), logits.argmax(dim=-1)
+
+
 class SDARPolicy(SDARForCausalLM):
     """Same weights/backbone; explicit likelihood path instead of diffusion loss."""
 
