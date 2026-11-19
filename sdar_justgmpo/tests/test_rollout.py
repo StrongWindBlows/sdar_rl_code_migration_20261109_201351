@@ -14,7 +14,8 @@ from inference_files import LEGACY_GENERATION_EXPORT
 from lmdeploy.pytorch.engine.model_agent import BaseModelAgent
 from lmdeploy.pytorch.strategies.base.model_inputs import make_dummy_inputs
 from lmdeploy.pytorch.strategies.ar.model_agent import ARModelAgentStrategy
-from lmdeploy.pytorch.strategies.dllm.model_agent import DLLMModelAgentStrategy
+from lmdeploy.pytorch.strategies.dllm.model_agent import DLLMExtraInputs, DLLMModelAgentStrategy
+from lmdeploy.pytorch.consts import DLLM_MASKED, DLLM_UNMASKED
 
 
 class RolloutTests(unittest.TestCase):
@@ -171,6 +172,34 @@ class RolloutTests(unittest.TestCase):
                 self.assertEqual(out.response_formats,('a',)*block_size+('b',)*block_size+('c',)*block_size)
                 self.assertEqual(out.stop_words.tolist(),[[1,2]]*block_size+[[3,4]]*block_size+[[5,6]]*block_size)
                 self.assertEqual(out.batch_size,3*block_size)
+
+    def test_random_draws_are_disjoint_across_positions_phases_and_blocks(self):
+        block = 4
+        for unmask_order in ((0, 1, 2, 3), (3, 0, 2, 1)):
+            seen = set()
+            for start in (8, 12):
+                mask = torch.full((block,), DLLM_MASKED)
+                inputs = SimpleNamespace(history_lengths=torch.tensor([start]),
+                                         seq_length=torch.tensor([block]))
+                for position in unmask_order:
+                    offsets = DLLMExtraInputs(mask).sampling_offsets(inputs).tolist()
+                    self.assertEqual(len(set(offsets)), block)
+                    self.assertTrue(seen.isdisjoint(offsets))
+                    seen.update(offsets)
+                    mask[position] = DLLM_UNMASKED
+
+    def test_random_draws_follow_logical_state_across_prefill_and_rebatching(self):
+        strategy = object.__new__(DLLMModelAgentStrategy)
+        strategy.block_size = 4
+        masked, filled = DLLM_MASKED, DLLM_UNMASKED
+        short = torch.tensor([filled, filled, masked, masked])
+        long = torch.tensor([filled]*4 + [filled, masked, masked, masked])
+        prefill = SimpleNamespace(history_lengths=torch.tensor([0, 0]), seq_length=torch.tensor([4, 8]))
+        packed = DLLMExtraInputs(torch.cat((short, long)))
+        offsets = strategy.slice_extra_inputs(packed, prefill.seq_length).sampling_offsets(prefill)
+        decode = SimpleNamespace(history_lengths=torch.tensor([4, 0]), seq_length=torch.tensor([4, 4]))
+        reordered = DLLMExtraInputs(torch.cat((long[-4:], short))).sampling_offsets(decode)
+        torch.testing.assert_close(offsets.reshape(2, 4).flip(0), reordered.reshape(2, 4))
 
 
 if __name__=='__main__': unittest.main()

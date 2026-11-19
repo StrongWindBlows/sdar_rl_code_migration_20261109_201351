@@ -23,6 +23,15 @@ class DLLMExtraInputs(ExtraInputs):
     """DLLM extra inputs."""
     dllm_mask: torch.Tensor
 
+    def sampling_offsets(self, inputs: ModelInputs) -> torch.Tensor:
+        """Give every candidate a fresh RNG offset whenever an unmasking step advances."""
+        mask = self.dllm_mask.reshape(inputs.seq_length.numel(), -1)
+        block_size = mask.size(1)
+        block_start = inputs.history_lengths + inputs.seq_length - block_size
+        filled = (mask != consts.DLLM_MASKED).sum(dim=1)
+        positions = torch.arange(block_size, device=mask.device)
+        return ((block_start + filled)[:, None] * block_size + positions).flatten()
+
 
 @dataclass
 class DLLMExtraOutputs(ExtraOutputs):

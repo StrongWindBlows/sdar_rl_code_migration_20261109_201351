@@ -27,6 +27,7 @@ from ..model_inputs import ModelInputs, step_ctx_manager
 from ..models.patch import BuildModelContext, add_adapters, build_patched_model, update_custom_module_map
 from ..strategies import build_strategy_factory
 from ..strategies.base.model_agent import ExtraInputs, ExtraOutputs, StoppingCriteria
+from ..strategies.dllm.model_agent import DLLMExtraInputs
 from ..utils import get_gpu_memory
 from ..weight_loader.model_weight_loader import load_model_weights
 from .cache_engine import CacheEngine
@@ -712,6 +713,8 @@ class BaseModelAgent:
             if need_output:
                 logger.debug(f'<ForwardTask> rank[{rank}]: Sampling [{idx}].')
                 # sampling
+                if sampling_inputs.random_offsets is not None and isinstance(extra_inputs, DLLMExtraInputs):
+                    sampling_inputs.random_offsets = extra_inputs.sampling_offsets(inputs)
                 next_token_ids, logprobs = await self.async_sampling_logits(last_logits, sampling_inputs, inputs)
 
                 with self._broadcast_next_token(next_token_ids, dist_ctx, enable=need_broadcast_next):
