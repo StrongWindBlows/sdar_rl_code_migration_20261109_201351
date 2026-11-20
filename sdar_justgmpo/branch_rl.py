@@ -29,7 +29,7 @@ def write(path, data):
     temporary.replace(path)
 
 
-def make_splits(config):
+def make_splits(config, *, exclude_splits=(), with_population=False):
     """Use questions absent from earlier saved RL rollouts for the three new splits."""
     history = load_math(config['math500_data'])
     seen = {' '.join(row['question'].split()) for row in history}
@@ -37,6 +37,9 @@ def make_splits(config):
         with path.open() as file:
             for line in file:
                 seen.add(' '.join(json.loads(line)['question'].split()))
+    for path in exclude_splits:
+        for rows in read(path).values():
+            seen.update(' '.join(row['question'].split()) for row in rows)
     fresh = []
     for row in load_math(config['train_data'], training=True):
         key = ' '.join(row['question'].split())
@@ -53,7 +56,7 @@ def make_splits(config):
             raise ValueError(f'Insufficient fresh questions for {name}')
         cursor = end
     splits['math500'] = [dict(row, index=i) for i, row in enumerate(history, cursor)]
-    return splits
+    return (splits, len(fresh)) if with_population else splits
 
 
 def generate(config, devices, model, rows, mode, cache):

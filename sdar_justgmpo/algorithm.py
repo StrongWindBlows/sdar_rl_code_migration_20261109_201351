@@ -94,6 +94,21 @@ def backward_on_policy_grpo(model, response, minibatch_size, temperature=1.0, ph
     return stats
 
 
+def backward_rloo(model, response, minibatch_size, temperature=1.0, phase_batch_size=1):
+    """On-policy gradient of expected terminal reward, with a leave-one-out baseline."""
+    stats = dict(loss=0.0, entropy_sum=0.0, tokens=0, clipped=0,
+                 log_ratio_sum=0.0, log_ratio_square_sum=0.0, log_ratio_abs_max=0.0)
+    if response.advantage == 0:
+        return stats
+    for _, logps, entropy in phase_logps(model, response, temperature, phase_batch_size):
+        loss = -response.advantage * logps.sum()
+        (loss / minibatch_size).backward()
+        stats['loss'] += loss.detach().item()
+        stats['entropy_sum'] += entropy.sum().item()
+    stats['tokens'] = len(response.tokens)
+    return stats
+
+
 def backward_response(model, response, minibatch_size, temperature=1.0,
                       epsilon=0.4, objective='gmpo', phase_batch_size=1):
     """Two-pass, phase-streamed gradient of the complete response objective.

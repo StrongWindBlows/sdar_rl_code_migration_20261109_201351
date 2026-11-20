@@ -23,8 +23,8 @@ import torch.distributed as dist
 from transformers import AutoTokenizer, GenerationConfig
 
 from algorithm import (Response, group_advantages, cache_old_logps, backward_response,
-                       backward_on_policy_grpo, response_logps)
-from cooperative import prepare_coupled, backward_coupled
+                       backward_on_policy_grpo, backward_rloo, response_logps)
+from cooperative import prepare_coupled, backward_coupled, leave_one_out
 from data import load_math
 from eval import merge_evaluations
 from likelihood import SDARPolicy
@@ -71,7 +71,7 @@ def arguments():
                    help='Shared learner/rollout block size; default: model config (legacy fallback 4)')
     p.add_argument('--tp-size',type=int,default=1,help='Learner and rollout tensor-parallel size')
     p.add_argument('--dp-size',type=int,default=None,help='Optional check of WORLD_SIZE / tp-size')
-    p.add_argument('--objective', choices=['gmpo','grpo','coupled'], default='gmpo')
+    p.add_argument('--objective', choices=['gmpo','grpo','coupled','rloo'], default='gmpo')
     p.add_argument('--coupling-beta', type=float, default=1e-4,
                    help='Full-answer KL coefficient for E_S[R] - beta * KL(S || P)')
     p.add_argument('--clip', type=float, default=0.4, help='Symmetric LOG-ratio clipping radius')
@@ -79,6 +79,8 @@ def arguments():
     p.add_argument('--temperature', type=float, default=1.0)
     p.add_argument('--seed', type=int, default=1234)
     p.add_argument('--save-every', type=int, default=10, help='Checkpoint interval in rollout rounds')
+    p.add_argument('--direction-output', help='Export the FP32 weight delta from one fresh RLOO round')
+    p.add_argument('--direction-replay', type=str, help='Reuse the saved TP rollout for a direction export')
     p.add_argument('--eval-every', type=int, default=0, help='Evaluation interval; 0 follows save-every')
     p.add_argument('--eval-at-start', action=argparse.BooleanOptionalAction, default=False)
     p.add_argument('--eval-data', help='Evaluate this test set; omit to disable')
@@ -94,19 +96,38 @@ def arguments():
     return p.parse_args()
 
 
-def make_responses(rows, rollout, tokenizer, reward, group_size, seed, temperature):
+def make_responses(rows, rollout, tokenizer, reward, group_size, seed, temperature,
+                   advantage_fn=group_advantages, *, replay=None):
     prompts = [format_prompt(tokenizer, row['question']) for row in rows]
-    samples = rollout.sample(prompts, group_size, seed, temperature)
+    if replay is None:
+        samples = rollout.sample(prompts, group_size, seed, temperature)
+    else:
+        request = json.loads(replay.with_name(replay.name.replace('response-', 'request-')).read_text())
+        samples = json.loads(replay.read_text())
+        if ([request[key] for key in ('prompts', 'group_size', 'seed', 'temperature')]
+                != [prompts, group_size, seed, temperature] or len(samples) != len(prompts) * group_size):
+            raise ValueError(f'Saved rollout does not match this batch: {replay}')
     texts = [tokenizer.decode(tokens, skip_special_tokens=True) for tokens, _ in samples]
     answers = [row['ground_truth_answer'] for row in rows for _ in range(group_size)]
     rewards, timeouts = reward.score(texts, answers, [done for _, done in samples])
-    advantages = group_advantages(torch.tensor(rewards).reshape(-1, group_size)).flatten().tolist()
+    advantages = advantage_fn(torch.tensor(rewards).reshape(-1, group_size)).flatten().tolist()
     records = []
     for i, (sample, value, advantage) in enumerate(zip(samples, rewards, advantages)):
         tokens, finished = sample
         prompt_ids = tokenizer.encode(prompts[i//group_size], add_special_tokens=False)
         records.append(Response(prompt_ids, tokens, value, finished, advantage))
     return records, timeouts
+
+
+@torch.no_grad()
+def step_direction_on_cpu(model, optimizer):
+    """The first AdamW step is independent for each parameter."""
+    for parameter in model.parameters():
+        cpu_parameter = torch.nn.Parameter(parameter.detach().to('cpu', copy=True))
+        cpu_parameter.grad = parameter.grad.cpu()
+        parameter.grad = None
+        torch.optim.AdamW([dict(optimizer.defaults, params=[cpu_parameter])]).step()
+        parameter.copy_(cpu_parameter)
 
 
 def minibatches(responses, size, seed):
@@ -247,8 +268,13 @@ def train(args):
     updates_per_round = args.batch_prompts * args.group_size // args.minibatch_size * args.ppo_epochs
     single_update_grpo = args.objective == 'grpo' and updates_per_round == 1
     coupled = args.objective == 'coupled'
-    if coupled and updates_per_round != 1:
-        raise ValueError('The coupled objective requires exactly one update per rollout batch')
+    rloo = args.objective == 'rloo'
+    if (coupled or rloo) and updates_per_round != 1:
+        raise ValueError(f'{args.objective} requires exactly one update per rollout batch')
+    if args.direction_output and (not rloo or metadata or args.steps != 1 or args.eval_data):
+        raise ValueError('--direction-output requires one fresh RLOO round without in-trainer evaluation')
+    if args.direction_replay and not args.direction_output:
+        raise ValueError('--direction-replay requires --direction-output')
     config = vars(args) | dict(world_size=world, dataset_rows=len(rows), total_steps=args.steps,
         algorithm=args.objective.upper(), policy_updates_per_batch=updates_per_round,
         kl_beta=0.0, master_dtype='float32', rollout_order='sequential',
@@ -261,11 +287,16 @@ def train(args):
             advantage_normalization='leave_one_out(reward - coupling_beta * sequence_logp_gap)',
             coupling_parallel_policy='independent_current_block_given_clean_history',
             coupling_objective='E_S[reward] - coupling_beta * KL(S || P)')
+    if rloo:
+        config.update(loss_normalization='mean_responses(sum_valid_tokens)',
+                      advantage_normalization='leave_one_out(reward)')
     if rank == 0:
         print(f'Loaded {len(rows)} training examples from {args.data}', flush=True)
         mode = 'single-pass on-policy GRPO' if single_update_grpo else 'two-pass with frozen old log-probs'
         if coupled:
             mode = f'coupled on-policy gradient, beta={args.coupling_beta:g}; statistics + shared backward'
+        if rloo:
+            mode = 'single-pass on-policy RLOO'
         print(f'Likelihood: {mode}; phases per forward: {args.train_phase_batch_size}', flush=True)
     start = metadata['completed_steps'] if metadata else 0
     nonzero_updates = metadata['nonzero_updates'] if metadata else 0
@@ -301,7 +332,8 @@ def train(args):
     def finish(path):
         if rank == 0:
             result = dict(completed_rounds=args.steps, optimizer_steps=args.steps*updates_per_round,
-                          nonzero_updates=nonzero_updates, final_model=str(path), status='completed')
+                          nonzero_updates=nonzero_updates, status='completed')
+            result['direction' if args.direction_output else 'final_model'] = str(path)
             (output/'completed.json').write_text(json.dumps(result, indent=2))
             run.summary.update(result)
             run.finish()
@@ -330,7 +362,11 @@ def train(args):
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, betas=(0.9,0.999),
                                    eps=1e-8, weight_decay=0.0, foreach=False)
     rng = restore_full_checkpoint(args.resume, model, optimizer, rank,parallel=parallel) if metadata else None
-    if args.tp_size > 1:
+    if args.direction_output and parallel.dp_rank == 0:
+        direction_origin = parallel.full_state(model, dtype=torch.float32)
+    if args.direction_replay:
+        rollout = None
+    elif args.tp_size > 1:
         from parallel_rollout import ParallelRollout
         rollout = ParallelRollout(parallel,tokenizer,args)
     else:
@@ -370,7 +406,8 @@ def train(args):
             run.finish(exit_code=1)
         if reward is not None:
             reward.close()
-        rollout.close()
+        if rollout is not None:
+            rollout.close()
         if world > 1:
             dist.destroy_process_group()
         raise RuntimeError(f'{error}; saved training state at {path}')
@@ -381,12 +418,16 @@ def train(args):
     for step in range(start, args.steps):
         tick = time.time()
         batch = [rows[i % len(rows)] for i in range(step*args.batch_prompts, (step+1)*args.batch_prompts)]
-        rollout.update_weights(model)
+        if rollout is not None:
+            rollout.update_weights(model)
         payload = None
         if parallel.tp_rank == 0:
             try:
+                replay = (Path(args.direction_replay) / f'response-dp{parallel.dp_rank}.json'
+                          if args.direction_replay else None)
                 recs,timeouts = make_responses(batch[parallel.dp_rank::dp_size], rollout, tokenizer, reward,
-                    args.group_size,args.seed+step*100000+parallel.dp_rank*1000,args.temperature)
+                    args.group_size,args.seed+step*100000+parallel.dp_rank*1000,args.temperature,
+                    leave_one_out if rloo else group_advantages, replay=replay)
                 payload = (None,recs,timeouts)
             except Exception as exc:
                 payload = (repr(exc),None,None)
@@ -427,7 +468,7 @@ def train(args):
                         advantages=[r.advantage for r in group],
                         **(dict(logp_gaps=gaps[i*args.group_size:(i+1)*args.group_size]) if coupled else {})))+'\n')
         print(f'Rank {rank}, round {step+1}: sampled {len(recs)} responses', flush=True)
-        if not (single_update_grpo or coupled):
+        if not (single_update_grpo or coupled or rloo):
             print(f'Rank {rank}: caching old log-probs', flush=True)
             cache_old_logps(model, recs, args.temperature, args.train_phase_batch_size)
         updates = []
@@ -442,15 +483,24 @@ def train(args):
                             args.temperature, args.train_phase_batch_size, args.train_logit_chunk_size))
                         if parallel.tp_rank == 0 and (i % 32 == 0 or i == len(mb)):
                             print(f'Rank {rank}, round {step+1}: coupled backward {i}/{len(mb)}', flush=True)
-                elif single_update_grpo:
-                    stats = [backward_on_policy_grpo(model, r, len(mb), args.temperature,
-                                                    args.train_phase_batch_size) for r in mb]
+                elif single_update_grpo or rloo:
+                    backward = backward_rloo if rloo else backward_on_policy_grpo
+                    stats = []
+                    for i, response in enumerate(mb, 1):
+                        stats.append(backward(model, response, len(mb), args.temperature,
+                                              args.train_phase_batch_size))
+                        if rloo and parallel.tp_rank == 0 and (i % 32 == 0 or i == len(mb)):
+                            print(f'Rank {rank}, round {step+1}: RLOO backward {i}/{len(mb)}', flush=True)
                 else:
                     stats = [backward_response(model, r, len(mb), args.temperature, args.clip,
                                                args.objective, args.train_phase_batch_size) for r in mb]
                 parallel.reduce_gradients(model)
                 norm = parallel.clip_grad_norm(model)
-                optimizer.step()
+                if args.direction_output:
+                    if parallel.dp_rank == 0:
+                        step_direction_on_cpu(model, optimizer)
+                else:
+                    optimizer.step()
                 nonzero_updates += int(norm.item() > 0)
                 keys = ['loss','entropy_sum','tokens','clipped','log_ratio_sum','log_ratio_square_sum']
                 loss, entropy, tokens, clipped, logsum, log2sum = sum_metrics(
@@ -498,7 +548,7 @@ def train(args):
                 file.write(json.dumps(metrics)+'\n')
         round_number = step+1
         full_path = None
-        if round_number % args.save_every == 0 or round_number == args.steps:
+        if not args.direction_output and (round_number % args.save_every == 0 or round_number == args.steps):
             full_path = final_path if round_number == args.steps else output/f'checkpoint-{round_number}'
             checkpoint(round_number, full_path)
         if args.eval_data and (round_number % eval_every == 0 or full_path is not None):
@@ -521,10 +571,22 @@ def train(args):
                 abort(round_number, exc, full_path)
         if world > 1:
             dist.barrier()
+    if args.direction_output:
+        final_path = Path(args.direction_output)
+        if parallel.dp_rank == 0:
+            state = parallel.full_state(model, dtype=torch.float32)
+            if rank == 0:
+                for name, tensor in state.items():
+                    tensor.sub_(direction_origin[name])
+                staging = final_path.with_suffix('.tmp')
+                torch.save(state, staging)
+                staging.replace(final_path)
+                sync_metrics(run, [metrics])
     finish(final_path)
     if reward is not None:
         reward.close()
-    rollout.close()
+    if rollout is not None:
+        rollout.close()
     if world > 1:
         dist.destroy_process_group()
 
