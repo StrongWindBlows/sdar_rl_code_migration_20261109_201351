@@ -1,0 +1,11 @@
+{
+  "model": "../hug/model/SDAR-4B-Chat-b32",
+  "data": "../hug/data/JustGRPO-MATH-500/train.jsonl",
+  "questions": 500,
+  "seed": 20261120,
+  "gpus": [0, 1, 2, 3, 4, 5, 6, 7],
+  "block_size": 32,
+  "threshold": 0.9,
+  "max_tokens": 3000,
+  "cache_fraction": 0.25
+}

@@ -1,7 +1,7 @@
 """Small, process-local adapters around the existing LMDeploy engine."""
 import asyncio
 from collections import Counter
-from contextlib import ExitStack
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, field
 import gzip
 import json
@@ -100,6 +100,18 @@ class Backend:
             cfg.denoising_steps = setting['steps']
             cfg.confidence_threshold = setting.get('threshold', 0.9)
 
+    @contextmanager
+    def _block_setting(self, override, block_start):
+        if override is None or block_start != override[0]:
+            yield
+            return
+        original = self.setting
+        self.set_setting(override[1])
+        try:
+            yield
+        finally:
+            self.set_setting(original)
+
     def prompt(self, question):
         text = self.tokenizer.apply_chat_template(
             [{'role': 'user', 'content': question + INSTRUCTION}], tokenize=False, add_generation_prompt=True)
@@ -190,10 +202,12 @@ class Backend:
             input_ids = agent.agent_strategy.slice_outputs(inputs.input_ids.flatten(), inputs.seq_length)
             input_ids = input_ids.view(-1, self.block)
             proposals = next_ids.view(-1, self.block).clone()
-            out_ids, extra = original_post(inputs, logits, next_ids, extra)
+            bases = (inputs.history_lengths + inputs.seq_length - self.block).tolist()
+            track = self.tracks[inputs.model_metas[0]['ga_session']]
+            with self._block_setting(track.job.get('block_override'), bases[0]):
+                out_ids, extra = original_post(inputs, logits, next_ids, extra)
             out_ids = out_ids.view(-1, self.block)
             after = extra.dllm_mask.view(-1, self.block)
-            bases = (inputs.history_lengths + inputs.seq_length - self.block).tolist()
             for row, meta in enumerate(inputs.model_metas):
                 track = self.tracks[meta['ga_session']]
                 reached_source = False
@@ -288,6 +302,8 @@ class Backend:
             track.previous[base] = proposed
 
     async def _one(self, job):
+        if 'block_override' in job and self.config['batch_size'] != 1:
+            raise ValueError('A block override requires batch_size=1')
         job = dict(job, state_seed=self.config['seed'])
         sid = self.session
         self.session += 1

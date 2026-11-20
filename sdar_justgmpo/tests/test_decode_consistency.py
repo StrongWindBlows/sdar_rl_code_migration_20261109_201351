@@ -1,6 +1,7 @@
 import json
 import math
 from pathlib import Path
+import sys
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -10,6 +11,7 @@ import torch.nn.functional as F
 
 from algorithm import Response
 from analyze_reconstruction import read_rollouts, score_response, summarize as reconstruction_summary
+from cross_decode import GA, first_divergent_block
 from eval_decoding import counted_result, decoding_settings, summarize as decoding_summary
 from likelihood import SDARPolicy, phase_inputs, reconstruction_phases
 from test_algorithm import dense_packed
@@ -191,6 +193,25 @@ class AnalysisAndEvaluationTests(unittest.TestCase):
         self.assertEqual(settings[3]['strategy'], 'low_confidence_dynamic')
         with self.assertRaises(ValueError):
             decoding_settings(32, [3], [])
+
+    def test_first_divergent_block_includes_prompt_offset(self):
+        self.assertIsNone(first_divergent_block([4, 5, 6], [4, 5, 6], 30, 32))
+        self.assertEqual(first_divergent_block([4, 5, 6], [4, 0, 6], 30, 32), 0)
+        self.assertEqual(first_divergent_block([4, 5, 6], [4, 5, 0], 30, 32), 32)
+
+    def test_block_override_restores_the_receiver_after_each_forward(self):
+        with patch.object(sys, 'path', [str(GA), *sys.path]):
+            from engine import Backend
+
+        sequential, dynamic = decoding_settings(32, [], [0.9])
+        backend = Backend.__new__(Backend)
+        backend.setting = sequential
+        override = (64, dynamic)
+        with patch.object(backend, 'set_setting', side_effect=lambda s: setattr(backend, 'setting', s)):
+            for start, expected in [(32, sequential), (64, dynamic), (64, dynamic), (96, sequential)]:
+                with backend._block_setting(override, start):
+                    self.assertEqual(backend.setting, expected)
+                self.assertEqual(backend.setting, sequential)
 
     def test_forward_audit_keeps_eos_tail_compute_but_counts_only_returned_tokens(self):
         events = [dict(block_start=0, positions=[1, 2, 3], tokens=[6, 2, 9], phase='denoise'),
